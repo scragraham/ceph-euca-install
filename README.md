@@ -85,7 +85,7 @@ To install the Ceph Cluster:
 # ansible-playbook ceph-install.yml
 ```
 
-To install 'hammer' instead of Jewel (default) run the following instead:
+To install 'hammer' instead of Jewel (default) run the following:
 ```
 # ansible-playbook ceph-install.yml -e "ceph_release=hammer"
 ```
