@@ -14,7 +14,7 @@ The minimal install requires 3 nodes. In these playbooks the admin node is the s
 has only been tested that way.
 
 ### Get the playbooks/scripts
-git clone https://www.github.com/scragraham/ceph-euca-install
+git clone https://github.com/scragraham/ceph-euca-install
 
 ### Prerequisites
 Ansible must be installed, with the following groups populated:
