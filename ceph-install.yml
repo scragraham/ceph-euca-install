@@ -1,0 +1,329 @@
+
+#
+# This playbook follows the steps outlined by the ceph-deploy installation procedure.
+# http://docs.ceph.com/docs/master/start
+#
+# We use this homegrown playbook given the ceph-ansible playbooks are for jewel and luminous and we 
+# need to install hammer.
+#
+# Uses a filesystem instead of disks for osds, which will not perform well but will work.
+#
+- hosts: cephall
+  tasks:
+  - name: Install NTP
+    yum:
+      state: present
+      name:
+        - ntp
+        - ntpdate
+        - ntp-doc
+
+  - name: Stop NTP so we can set the date.
+    service:
+      name: ntpd
+      state: stopped
+      enabled: yes
+
+  - name: ntpdate update time
+    command: ntpdate pool.ntp.org
+
+  - name: Start NTP back up
+    service:
+      name: ntpd
+      state: started
+
+  - name: Install EPEL RPM keys
+    rpm_key:
+       state: present
+       key: https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-7 
+
+  - name: Install EPEL
+    yum_repository:
+      name: epel
+      description: EPEL Yum Repo
+      baseurl: https://download.fedoraproject.org/pub/epel/$releasever/$basearch/ 
+
+  - name: Yum priorities
+    yum:
+      name: yum-plugin-priorities
+      state: present
+
+  #
+  # ceph-deploy user setup
+  # ceph-deploy password (not really used)
+  # python to gen hash: from passlib.hash import sha512_crypt;sha512_crupt.encrypt("dummypassword")
+  # 
+  - name: Create ceph-deploy users
+    user:
+      name: ceph-deploy
+      comment: "Ceph Deploy user"
+      password: "{{ceph_deploy_password}}"
+      createhome: yes
+      groups: wheel
+      generate_ssh_key: yes
+
+  - name: Ensure wheel group exists
+    group:
+      name: wheel
+      state: present 
+ 
+  - name: Allow wheel group to have passwordless sudo
+    lineinfile:
+      dest: /etc/sudoers
+      state: present
+      regexp: '^%wheel' 
+      line: '%wheel ALL=(ALL) NOPASSWD: ALL'
+      validate: visudo -cf %s
+
+  # 
+  # by default we install jewel (set in the ceph_release in group_vars/all) 
+  #
+  - name: Install Ceph Repo
+    yum_repository:
+      name: ceph-noarch
+      description: Ceph noarch packages
+      baseurl: "https://download.ceph.com/rpm-{{ceph_release}}/el7/noarch"
+      gpgcheck: yes
+      gpgkey: https://download.ceph.com/keys/release.asc
+      enabled: yes
+
+  - name: Install ceph-deploy
+    yum: 
+      name: ceph-deploy
+      update_cache: yes
+      state: present
+
+  #
+  # need to disable firewalld in order for ceph-deploy to play nice
+  #
+  - name: Disable firewalld
+    service:
+      name: firewalld
+      enabled: no
+      state: stopped    
+
+#
+# Initialize the OSD so that ceph-deploy osd commands will work.
+# If using /home, systemd needs to be configured to allow access.
+#
+- hosts: cephosds
+  tasks:
+  - name: Systemd ceph-osd overrides directory exists
+    file:
+      path: /etc/systemd/system/ceph-osd@.service.d/
+      state: directory
+      mode: 0755
+      owner: root
+
+  - name: Systemd ceph-osd overrides to allow data to be in /home
+    copy:
+      content: |
+        [Service]
+        ProtectHome=false
+        ProtectSystem=false
+      dest: /etc/systemd/system/ceph-osd@.service.d/override.conf
+      mode: 0644
+    when: "'/home/' in osd_data_path"
+
+#
+# Deploy the key file to other hosts using delegate_to
+# from the *admin* node to the other nodes.
+#
+- hosts: cephadmin 
+  tasks:
+  - name: Copy ssh key to authorized keys from THIS host
+    authorized_key: 
+      user: ceph-deploy
+      state: present
+      key: "{{ lookup('file', '/home/ceph-deploy/.ssh/id_rsa.pub') }}"
+    when: not ansible_check_mode
+    delegate_to: "{{item}}"
+    with_items: "{{groups['cephall']}}" 
+
+  # Create an ssh config file for the ceph-deploy user
+  # so that default usernames don't have to be specified.
+  # Template Uses groups['cephall']
+  - name: Configure .ssh/config file
+    template: 
+      src: templates/sshconfig.j2
+      dest: /home/ceph-deploy/.ssh/config
+      mode: 0600
+
+  # directory that holds initial cluster information
+  - name: New cluster directory exists
+    file:
+      path: /home/ceph-deploy/new-cluster
+      owner: ceph-deploy
+      state: directory
+      mode: 0755
+
+  #
+  # Install the software using ceph-deploy *from* the admin box.
+  # ceph-deploy behaves like ansible in a way.
+  # 
+  # 
+  # Create the new cluster 
+  # 
+  - name: ceph-deploy new cluster
+    become: true
+    become_user: ceph-deploy
+    command: "ceph-deploy new {{groups['cephmoninitial'][0]}}"
+    args:
+      chdir: /home/ceph-deploy/new-cluster
+
+  #
+  # public_network is defined in group_vars/ceph-admin
+  #
+  - name: Add public network CIDR to ceph.conf file in the new-cluster directory
+    lineinfile:
+      dest: /home/ceph-deploy/new-cluster/ceph.conf
+      state: present
+      regexp: '^public_network'
+      line: 'public_network={{public_network}}'
+    when: not ansible_check_mode
+
+  #
+  # ceph-deploy install
+  # 
+  - name: ceph-deploy install 
+    become: true
+    become_user: ceph-deploy
+    command: "ceph-deploy install --release {{ceph_release}} {{item}}"
+    args:
+      chdir: /home/ceph-deploy/new-cluster
+    with_items: "{{ groups['cephall'] }}"
+
+  - name: ceph-deploy initial mon 
+    become: true
+    become_user: ceph-deploy
+    command: "ceph-deploy mon create-initial"
+    args:
+      chdir: /home/ceph-deploy/new-cluster
+
+  - name: ceph-deploy admin keys 
+    become: true
+    become_user: ceph-deploy
+    command: "ceph-deploy admin {{item}}"
+    args:
+      chdir: /home/ceph-deploy/new-cluster
+    with_items: "{{ groups['cephall'] }}"
+
+  #
+  # Deploy the bootstrap keyring so that ceph-disk can create the osd 
+  #
+  - name: Copy bootstrap keys to each host
+    copy: 
+      src: /home/ceph-deploy/new-cluster/ceph.bootstrap-osd.keyring
+      dest: /var/lib/ceph/bootstrap-osd/ceph.keyring
+    when: not ansible_check_mode
+    delegate_to: "{{item}}"
+    with_items: "{{groups['cephall']}}" 
+ 
+#
+# Need to jump back to the OSDs to create 
+# osd data directory with appropriate permissions (owner: ceph)
+#
+- hosts: cephosds
+  tasks:
+  - name: Directory for OSDs exist
+    file:
+      path: "{{osd_data_path}}"
+      state: directory
+      mode: 0755
+      owner: ceph
+
+#
+# Create the OSDs 
+ #
+- hosts: cephadmin
+  tasks:
+  - name: Prepare OSDs
+    become: true
+    become_user: ceph-deploy
+    command: "ceph-deploy osd prepare {{item}}:{{osd_data_path}}" 
+    args:
+      chdir: /home/ceph-deploy/new-cluster
+    with_items: "{{ groups['cephosds'] }}"
+
+  - name: Activate OSDs
+    become: true
+    become_user: ceph-deploy
+    command: "ceph-deploy osd activate {{item}}:{{osd_data_path}}" 
+    args:
+      chdir: /home/ceph-deploy/new-cluster
+    with_items: "{{ groups['cephosds'] }}"
+
+#
+# We should now have a functioning cluster, time to add the remaining mons
+# excluding the ceph-mon-initial node.
+# and install the radosgw
+#
+- hosts: cephadmin
+  tasks:
+  - name: ceph-deploy mon add 
+    become: true
+    become_user: ceph-deploy
+    command: "ceph-deploy mon add {{item}}"
+    args:
+      chdir: /home/ceph-deploy/new-cluster
+    with_items: "{{ groups['cephmonremaining'] }}"
+    register: command_output
+  - debug: msg="{{ item.stderr }}"
+    with_items: "{{command_output.results}}"
+
+  #
+  # Create the ceph Object Gateway (rgw) - pick the initial ceph-monitor as the host.
+  # Leave the civit web port alone (7480) - to be used in euca configuration.
+  #
+
+  # Needed when installing HAMMER
+  - name: ceph-deploy rgw install hammer
+    become: true
+    become_user: ceph-deploy
+    command: "ceph-deploy install --release {{ceph_release}} --rgw {{groups['cephmoninitial'][0]}}"
+    args:
+      chdir: /home/ceph-deploy/new-cluster
+    when: ceph_release == "hammer"
+    
+  - name: ceph-deploy rgw create
+    become: true
+    become_user: ceph-deploy
+    command: "ceph-deploy rgw create {{groups['cephmoninitial'][0]}}"
+    args:
+      chdir: /home/ceph-deploy/new-cluster
+
+#
+# Enable firewalld
+#
+- hosts: cephall
+  tasks:
+  - name: Enable firewalld
+    service:
+      name: firewalld
+      enabled: yes
+      state: started
+
+# Enable ports on monitors
+- hosts: cephmons
+  tasks:
+  - name: Enable ceph mon ports
+    firewalld: 
+      port: 6789/tcp
+      permanent: true
+      state: enabled
+
+  - name: Enable ceph rgw ports
+    firewalld:
+      port: 7480/tcp
+      permanent: true
+      state: enabled
+  
+# Enable ports on osds
+- hosts: cephosds
+  tasks:
+
+  - name: Enable ceph osd ports
+    firewalld:
+      port: 6800-6810/tcp
+      permanent: true
+      state: enabled

@@ -1,0 +1,120 @@
+#
+# Run these commands as the ceph-deploy user
+#
+- hosts: cephadmin 
+  become: true
+  become_user: ceph-deploy 
+  tasks:
+  - name: Confirm to proceed
+    pause: prompt="Please confirm that you want to destroy the ceph cluster. Enter to continue, Ctrl-C then 'a' to abort"
+
+  - name: ceph-deploy purge
+    command: ceph-deploy purge "{{item}}"
+    args:
+      chdir: /home/ceph-deploy/new-cluster
+    with_items: "{{ groups['cephall'] }}"
+ 
+  - name: ceph-deploy purgedata
+    command: ceph-deploy purgedata "{{item}}"
+    args:
+      chdir: /home/ceph-deploy/new-cluster
+    with_items: "{{ groups['cephall'] }}"
+ 
+  - name: ceph-deploy forget keys
+    command: ceph-deploy forgetkeys 
+    args:
+      chdir: /home/ceph-deploy/new-cluster
+
+  - name: remove new cluster directory
+    file:
+      path: /home/ceph-deploy/new-cluster
+      state: absent
+
+  # ceph-deploy is version specific so we need to nuke it too.
+  - name: Remove ceph-deploy
+    become: false
+    yum:
+      name: ceph-deploy
+      update_cache: yes
+      state: absent
+
+- hosts: cephosds
+  tasks:
+  - name: remove osd data directory
+    file: 
+      path: /home/osd/osd0
+      state: absent
+
+  - name: Disable ceph osd ports
+    firewalld:
+      port: 6800-6810/tcp
+      permanent: true
+      state: disabled
+
+# Disable ports on monitors
+- hosts: cephmons
+  tasks:
+  - name: Disable ceph mon ports
+    firewalld: 
+      port: 6789/tcp
+      permanent: true
+      state: disabled
+
+  - name: Disable ceph rgw ports
+    firewalld:
+      port: 7480/tcp
+      permanent: true
+      state: disabled
+
+#
+# Clean up the yum repository so that we can install
+# any version of ceph.
+# 
+- hosts: cephall
+  tasks:
+  - name: Remove librados
+    yum:
+      name: "{{item}}" 
+      state: absent
+    with_items:
+      - librados2
+      - libradosstriper1 
+      - libcephfs1
+
+  - name: Remove Ceph Repo 
+    yum_repository:
+      name: ceph-noarch
+      description: Ceph noarch packages
+      baseurl: "https://download.ceph.com/rpm-{{ceph_release}}/el7/noarch"
+      gpgcheck: yes
+      gpgkey: https://download.ceph.com/keys/release.asc
+      enabled: no
+      state: absent
+    notify: yum-clean-expire-cache
+
+  - name: Systemd ceph-osd overrides directory removal 
+    file:
+      path: /etc/systemd/system/ceph-osd@.service.d/
+      state: absent
+
+  - name: Remove the yum repo caches
+    file:
+      path: "{{item}}"
+      state: absent
+    with_items: 
+       - /var/cache/yum/x86_64/7/Ceph/
+       - /var/cache/yum/x86_64/7/Ceph-noarch/
+       - /var/cache/yum/x86_64/7/ceph-noarch/
+       - /var/cache/yum/x86_64/7/ceph-source/
+       - /etc/yum.repos.d/ceph.repo.rpmsave
+
+  #
+  # Needed to clear out yum metadata cache otherwise the 
+  # next call of ceph-install will deploy the latest repo no matter what
+  # ceph_release is specified.
+  #
+  handlers:
+  - name: yum-clean-expire-cache
+    command: yum clean expire-cache
+    args: 
+      warn: no

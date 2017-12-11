@@ -1,0 +1,5 @@
+{% for host in groups['cephall'] %}
+Host {{ host }}
+   Hostname {{ host }}
+   User ceph-deploy
+{% endfor %}

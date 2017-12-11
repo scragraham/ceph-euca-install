@@ -1,0 +1,2 @@
+ceph_release: jewel
+ceph_deploy_password: HASHED_PASSWORD 
